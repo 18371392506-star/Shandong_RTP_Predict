@@ -617,18 +617,39 @@ if st.sidebar.button("🚀 开始训练与预测"):
                 # -------------------- 10. 准备下载数据 --------------------
                 st.header("📥 下载预测结果")
 
-                future_merged['分钟'] = future_merged.index.minute
-                future_merged['预测电价_24点'] = np.where(
-                    future_merged['分钟'] == 0,
-                    future_merged['预测电价'],
+                # ==== 计算24点平均电价（整点+后三刻平均）====
+                # 保留原始索引（DatetimeIndex）为列，用于后续重新设置索引
+                future_merged_reset = future_merged.reset_index().rename(columns={'index': 'datetime'})
+                
+                # 添加小时列用于分组
+                future_merged_reset['小时'] = future_merged_reset['datetime'].dt.hour
+                
+                # 按日期和小时计算平均电价
+                hourly_avg = future_merged_reset.groupby(['日期', '小时'])['预测电价'].mean().reset_index()
+                hourly_avg.rename(columns={'预测电价': '小时平均电价'}, inplace=True)
+                
+                # 合并平均电价
+                future_merged_reset = future_merged_reset.merge(hourly_avg, on=['日期', '小时'], how='left')
+                
+                # 恢复 DatetimeIndex，以便使用 .minute 属性
+                future_merged_reset.set_index('datetime', inplace=True)
+                
+                # 生成24点列：只在分钟为0的行填入小时平均电价
+                future_merged_reset['预测电价_24点'] = np.where(
+                    future_merged_reset.index.minute == 0,
+                    future_merged_reset['小时平均电价'],
                     np.nan
                 )
-
-                output_df = future_merged[[
+                
+                # 删除临时列
+                future_merged_reset.drop(columns=['小时', '小时平均电价'], inplace=True, errors='ignore')
+                
+                # 构建输出DataFrame
+                output_df = future_merged_reset[[
                     '日期', '全网负荷', '直调负荷', '风电', '光伏',
                     '预测电价', '预测电价_24点'
                 ]].copy()
-                output_df['时刻'] = future_merged.index.strftime('%H:%M')
+                output_df['时刻'] = future_merged_reset.index.strftime('%H:%M')
                 output_df.reset_index(drop=True, inplace=True)
 
                 cols_order = ['日期', '时刻', '全网负荷', '直调负荷', '风电', '光伏',
