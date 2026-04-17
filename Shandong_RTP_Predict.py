@@ -81,6 +81,22 @@ def parse_time_to_slot(time_str):
         minute = int(parts[1])
         return hour * 4 + minute // 15
 
+def extract_date_from_filename(filename):
+    """
+    从文件名中智能提取日期字符串（YYYY-MM-DD 或 YYYYMMDD）
+    返回标准格式 'YYYY-MM-DD'，若提取失败返回 None
+    """
+    # 匹配 YYYY-MM-DD 格式
+    match = re.search(r'(\d{4}-\d{2}-\d{2})', filename)
+    if match:
+        return match.group(1)
+    # 匹配 YYYYMMDD 格式
+    match = re.search(r'(\d{8})', filename)
+    if match:
+        date_str = match.group(1)
+        return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+    return None
+
 # ==================== 特征名称英文映射（用于可视化）====================
 FEATURE_NAME_EN_MAP = {
     '全网负荷': 'Total Load',
@@ -123,7 +139,7 @@ load_hist_files = st.sidebar.file_uploader(
 )
 
 load_future_files = st.sidebar.file_uploader(
-    "未来出力文件 (预测值，格式同历史出力，文件名无限制)",
+    "未来出力文件 (预测值，文件名无限制，程序会自动提取日期)",
     type=["xlsx"],
     accept_multiple_files=True,
     key="load_future"
@@ -222,7 +238,7 @@ if st.sidebar.button("🚀 开始训练与预测"):
                     """
                     读取出力文件（历史或未来）
                     check_filename=True: 要求文件名符合 '山东_出力-实际【总】_YYYY-MM-DD.xlsx' 格式，并从文件名提取日期
-                    check_filename=False: 不校验文件名，仅依赖内部数据时刻列构造日期索引
+                    check_filename=False: 不校验文件名，智能从文件名提取日期或从时刻列解析完整时间
                     """
                     load_dfs = []
                     for f in files:
@@ -262,17 +278,28 @@ if st.sidebar.button("🚀 开始训练与预测"):
                         df_clean = df_load[[col_mapping[k] for k in required]].copy()
                         df_clean.columns = required
 
-                        # 如果没有文件名日期，尝试从时刻列推断（假设时刻为字符串，如'2025-04-15 00:00'）
+                        # 处理未来出力文件：不要求文件名格式
                         if not check_filename:
-                            # 检查时刻列是否已包含日期信息
-                            sample_time = str(df_clean['时刻'].iloc[0])
-                            if len(sample_time) > 8 and ('-' in sample_time or '/' in sample_time):
-                                # 尝试直接解析完整日期时间
-                                df_clean['datetime'] = pd.to_datetime(df_clean['时刻'])
+                            # 1. 优先尝试从文件名智能提取日期
+                            extracted_date = extract_date_from_filename(f.name)
+                            if extracted_date:
+                                date_str = extracted_date
+                                df_clean['datetime'] = df_clean['时刻'].apply(
+                                    lambda t: parse_datetime_with_24hour(date_str, str(t))
+                                )
                             else:
-                                st.error(f"未来出力文件 {f.name} 未提供文件名日期，且时刻列不包含完整日期信息，无法解析。请确保时刻列包含完整日期时间或文件名包含日期。")
-                                continue
+                                # 2. 若文件名无日期，检查时刻列是否包含完整日期时间
+                                sample_time = str(df_clean['时刻'].iloc[0])
+                                if len(sample_time) > 8 and ('-' in sample_time or '/' in sample_time):
+                                    df_clean['datetime'] = pd.to_datetime(df_clean['时刻'])
+                                else:
+                                    st.error(
+                                        f"未来出力文件 {f.name} 无法确定日期。"
+                                        "请确保文件名包含日期（如 2026-04-17）或时刻列包含完整日期时间。"
+                                    )
+                                    continue
                         else:
+                            # 历史出力：使用文件名中的日期
                             df_clean['datetime'] = df_clean['时刻'].apply(
                                 lambda t: parse_datetime_with_24hour(date_str, t)
                             )
@@ -290,7 +317,7 @@ if st.sidebar.button("🚀 开始训练与预测"):
 
                 # 历史出力：必须校验文件名以获取日期
                 hist_load = read_load_files(load_hist_files, check_filename=True)
-                # 未来出力：不校验文件名，允许任意名称
+                # 未来出力：不校验文件名，智能提取日期
                 future_load = read_load_files(load_future_files, check_filename=False)
 
                 if hist_load.empty:
