@@ -19,14 +19,6 @@ st.set_page_config(page_title="电价预测系统", layout="wide")
 st.title("⚡ 电力市场实时电价预测")
 st.markdown("上传历史电价、出力数据及气象数据，训练模型并预测未来电价。")
 
-# ==================== 安全 MAPE 计算函数 ====================
-def safe_mape(y_true, y_pred, threshold=1e-6):
-    """计算 MAPE，自动过滤真实值接近 0 的样本，避免除零错误。"""
-    mask = np.abs(y_true) > threshold
-    if np.sum(mask) == 0:
-        return np.nan
-    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
-
 # ==================== 工具函数 ====================
 def parse_datetime_with_24hour(date_str, time_str):
     """处理 24:00 的特殊情况，将其转为次日 00:00"""
@@ -131,7 +123,7 @@ load_hist_files = st.sidebar.file_uploader(
 )
 
 load_future_files = st.sidebar.file_uploader(
-    "未来出力文件 (预测值，格式同历史出力)",
+    "未来出力文件 (预测值，格式同历史出力，文件名无限制)",
     type=["xlsx"],
     accept_multiple_files=True,
     key="load_future"
@@ -226,14 +218,22 @@ if st.sidebar.button("🚀 开始训练与预测"):
                 price_96 = build_continuous_price_series(price_data)
 
                 # -------------------- 2. 读取出力数据 --------------------
-                def read_load_files(files):
+                def read_load_files(files, check_filename=True):
+                    """
+                    读取出力文件（历史或未来）
+                    check_filename=True: 要求文件名符合 '山东_出力-实际【总】_YYYY-MM-DD.xlsx' 格式，并从文件名提取日期
+                    check_filename=False: 不校验文件名，仅依赖内部数据时刻列构造日期索引
+                    """
                     load_dfs = []
                     for f in files:
-                        match = re.match(r"山东_出力-实际【总】_(\d{4}-\d{2}-\d{2})\.xlsx", f.name)
-                        if not match:
-                            st.warning(f"文件名 {f.name} 不符合出力文件格式，已跳过。")
-                            continue
-                        date_str = match.group(1)
+                        date_str = None
+                        if check_filename:
+                            match = re.match(r"山东_出力-实际【总】_(\d{4}-\d{2}-\d{2})\.xlsx", f.name)
+                            if not match:
+                                st.warning(f"文件名 {f.name} 不符合出力文件格式，已跳过。")
+                                continue
+                            date_str = match.group(1)
+
                         df_load = pd.read_excel(f, sheet_name="负荷信息")
                         col_mapping = {}
                         for col in df_load.columns:
@@ -257,15 +257,29 @@ if st.sidebar.button("🚀 开始训练与预测"):
                         required = ['时刻', '全网负荷', '直调负荷', '联络线受电负荷', '风电', '光伏',
                                     '地方电厂总加', '非市场化核电总加']
                         if not all(k in col_mapping for k in required):
-                            st.warning(f"{date_str} 负荷文件列名不匹配，跳过。")
+                            st.warning(f"文件 {f.name} 负荷信息列名不匹配，跳过。")
                             continue
                         df_clean = df_load[[col_mapping[k] for k in required]].copy()
                         df_clean.columns = required
-                        df_clean['datetime'] = df_clean['时刻'].apply(
-                            lambda t: parse_datetime_with_24hour(date_str, t)
-                        )
+
+                        # 如果没有文件名日期，尝试从时刻列推断（假设时刻为字符串，如'2025-04-15 00:00'）
+                        if not check_filename:
+                            # 检查时刻列是否已包含日期信息
+                            sample_time = str(df_clean['时刻'].iloc[0])
+                            if len(sample_time) > 8 and ('-' in sample_time or '/' in sample_time):
+                                # 尝试直接解析完整日期时间
+                                df_clean['datetime'] = pd.to_datetime(df_clean['时刻'])
+                            else:
+                                st.error(f"未来出力文件 {f.name} 未提供文件名日期，且时刻列不包含完整日期信息，无法解析。请确保时刻列包含完整日期时间或文件名包含日期。")
+                                continue
+                        else:
+                            df_clean['datetime'] = df_clean['时刻'].apply(
+                                lambda t: parse_datetime_with_24hour(date_str, t)
+                            )
+
                         df_clean.set_index('datetime', inplace=True)
                         load_dfs.append(df_clean)
+
                     if not load_dfs:
                         return pd.DataFrame()
                     load_all = pd.concat(load_dfs).sort_index()
@@ -274,8 +288,10 @@ if st.sidebar.button("🚀 开始训练与预测"):
                     load_all['净负荷'] = load_all['全网负荷'] - load_all['风电'] - load_all['光伏']
                     return load_all
 
-                hist_load = read_load_files(load_hist_files)
-                future_load = read_load_files(load_future_files)
+                # 历史出力：必须校验文件名以获取日期
+                hist_load = read_load_files(load_hist_files, check_filename=True)
+                # 未来出力：不校验文件名，允许任意名称
+                future_load = read_load_files(load_future_files, check_filename=False)
 
                 if hist_load.empty:
                     st.error("历史出力数据为空。")
@@ -440,10 +456,9 @@ if st.sidebar.button("🚀 开始训练与预测"):
                 train_mae = mean_absolute_error(y_train, y_train_pred)
                 train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
                 train_r2 = r2_score(y_train, y_train_pred)
-                train_mape = safe_mape(y_train, y_train_pred)
 
                 # 验证集评估（如果存在）
-                val_mae = val_rmse = val_r2 = val_mape = None
+                val_mae = val_rmse = val_r2 = None
                 y_val_pred = None
                 if use_validation:
                     y_val_pred = model.predict(X_val)
@@ -452,25 +467,22 @@ if st.sidebar.button("🚀 开始训练与预测"):
                     val_mae = mean_absolute_error(y_val, y_val_pred)
                     val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
                     val_r2 = r2_score(y_val, y_val_pred)
-                    val_mape = safe_mape(y_val, y_val_pred)
 
                 # -------------------- 9. 可视化（升级为3x2布局） --------------------
                 st.header("📊 模型拟合效果")
 
-                # 显示训练集指标
-                col1, col2, col3, col4 = st.columns(4)
+                # 显示训练集指标（无 MAPE）
+                col1, col2, col3 = st.columns(3)
                 col1.metric("训练集 MAE", f"{train_mae:.2f} 元/MWh")
                 col2.metric("训练集 RMSE", f"{train_rmse:.2f} 元/MWh")
                 col3.metric("训练集 R²", f"{train_r2:.4f}")
-                col4.metric("训练集 MAPE", f"{train_mape:.2f}%" if not np.isnan(train_mape) else "N/A")
 
-                # 如果有验证集，显示验证集指标
+                # 如果有验证集，显示验证集指标（无 MAPE）
                 if use_validation:
-                    col5, col6, col7, col8 = st.columns(4)
+                    col5, col6, col7 = st.columns(3)
                     col5.metric("验证集 MAE", f"{val_mae:.2f} 元/MWh")
                     col6.metric("验证集 RMSE", f"{val_rmse:.2f} 元/MWh")
                     col7.metric("验证集 R²", f"{val_r2:.4f}")
-                    col8.metric("验证集 MAPE", f"{val_mape:.2f}%" if not np.isnan(val_mape) else "N/A")
 
                     if val_mae > train_mae * 1.3:
                         st.warning("⚠️ 验证集误差明显高于训练集，可能存在过拟合。建议增加正则化或减少模型复杂度。")
